@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <?!= include('CSS'); ?>
+</head>
+<body>
+  <header class="topbar">
+    <button class="burger" id="burger" aria-label="เมนู">☰</button>
+    <div class="ttl"><b id="schoolTitle">ระบบตารางสอนของโรงเรียนวัดแสนเกษม</b><small id="schoolSub">กำลังโหลด…</small></div>
+    <select id="termSel" aria-label="ภาคเรียน"></select>
+  </header>
+  <div class="layout">
+    <nav class="drawer" id="drawer"></nav>
+    <div class="scrim" id="scrim"></div>
+    <main id="app"><div class="loading"><span class="spin"></span> กำลังโหลดข้อมูล…</div></main>
+  </div>
+  <div id="toast"></div>
+  <?!= include('JavaScript'); ?>
+</body>
+</html>

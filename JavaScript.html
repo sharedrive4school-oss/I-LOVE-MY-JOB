@@ -1,0 +1,713 @@
+<script>
+/* ระบบตารางสอนของโรงเรียนวัดแสนเกษม — หน้าเว็บ (Phase 10–12)
+ * ข้อมูลทั้งหมดมาจาก Google Sheets ผ่าน api() — หน้าเว็บไม่เก็บข้อมูลชุดที่สอง
+ * สิทธิ์ Admin ตรวจที่เซิร์ฟเวอร์ทุกครั้ง หน้าเว็บเก็บเพียง token ชั่วคราว */
+
+const S = { boot: null, term: '', admin: null, page: 'home', arg: null, cache: {}, schema: null,
+  dailyDate: '', teacherId: '', teacherView: 'week', classDay: {}, editClass: '', editSel: null, editOpts: null };
+const MONTHS = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+const DN = { 1: 'จันทร์', 2: 'อังคาร', 3: 'พุธ', 4: 'พฤหัสบดี', 5: 'ศุกร์', 6: 'เสาร์', 7: 'อาทิตย์' };
+
+// ---------- เครื่องมือ ----------
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) { return null; } }
+function sstore(k, v) { try { if (v === undefined) return sessionStorage.getItem(k); if (v === null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, v); } catch (e) { return null; } }
+function thaiDate(iso, withDay) {
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return (withDay ? 'วัน' + DN[dow === 0 ? 7 : dow] + 'ที่ ' : '') + d + ' ' + MONTHS[m - 1] + ' ' + (y + 543);
+}
+function addDays(iso, n) { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+function toast(msg, ms) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast._t); toast._t = setTimeout(() => (t.style.display = 'none'), ms || 3000); }
+function loading(msg) { return '<div class="loading"><span class="spin"></span> ' + esc(msg || 'กำลังโหลด…') + '</div>'; }
+function errBox(e) {
+  const det = e && e.details && e.details.length && e.details[0] && e.details[0].message ? '<ol>' + e.details.slice(0, 30).map((x) => '<li>' + esc(x.message) + '</li>').join('') + '</ol>' : '';
+  return '<div class="alert err">' + esc(e && e.message ? e.message : e) + det + '</div>';
+}
+
+function api(action, payload) {
+  return new Promise((resolve, reject) => {
+    if (!(window.google && google.script && google.script.run)) { reject(new Error('หน้านี้ต้องเปิดผ่านลิงก์ Web App')); return; }
+    google.script.run
+      .withSuccessHandler((r) => {
+        if (r && r.ok) return resolve(r.data);
+        const e = new Error(r && r.error ? r.error.message : 'เกิดข้อผิดพลาด');
+        e.code = r && r.error && r.error.code; e.details = r && r.error && r.error.details;
+        if (e.code === 'AUTH' && S.admin) { setAdmin(null); toast('หมดเวลาการเข้าสู่ระบบ กรุณาเข้าสู่ระบบใหม่'); }
+        reject(e);
+      })
+      .withFailureHandler((err) => reject(new Error(err && err.message ? err.message : String(err))))
+      .api({ action: action, payload: payload || {}, token: S.admin ? S.admin.token : null });
+  });
+}
+
+// ---------- ข้อมูลอ้างอิง ----------
+const TT = (id) => (S.boot.teachers.find((t) => t.teacher_id === id) || {});
+const tShort = (id) => TT(id).short_name || id || '';
+const tName = (id) => TT(id).name || id || '';
+const SJ = (id) => (S.boot.subjects.find((s) => s.subject_id === id) || { name: id, color: '' });
+const CL = (id) => (S.boot.classes.find((c) => c.class_id === id) || { name: id });
+const termObj = (id) => S.boot.terms.find((t) => t.term_id === (id || S.term)) || {};
+const termLabel = (id) => { const t = termObj(id); return t.term_id ? 'ภาคเรียนที่ ' + t.semester + '/' + t.year : ''; };
+const ttClasses = () => S.boot.classes.filter((c) => c.in_timetable).sort((a, b) => a.sort_order - b.sort_order);
+const activeTeachers = () => S.boot.teachers.filter((t) => t.status === 'ใช้งาน');
+
+async function cached(key, fn) { if (!S.cache[key]) S.cache[key] = fn(); try { return await S.cache[key]; } catch (e) { delete S.cache[key]; throw e; } }
+const getTermData = (term) => cached('td|' + term, () => api('public.termData', { term_id: term }));
+const getMaster = (term) => cached('m|' + term, () => api('public.master', { term_id: term }));
+const getSubReport = (term) => cached('sr|' + term, () => api('public.subReport', { term_id: term }));
+function clearCache() { S.cache = {}; }
+async function reloadBoot() { S.boot = await api('public.bootstrap'); clearCache(); fillTerms(); }
+
+// ---------- โครงหน้า ----------
+const NAV = () => [
+  ['home', '🏠', 'หน้าหลัก'], ['daily', '📅', 'ตารางรายวัน'], ['teacher', '👩‍🏫', 'ตารางครู'], ['overview', '🏫', 'ตารางภาพรวม'], ['sep'],
+  ...ttClasses().map((c) => ['class:' + c.class_id, '📚', 'ตาราง ' + c.name]), ['sep'],
+  ['subs', '🔄', 'จัดสอนแทน'], ['absence', '👤', 'ครูไม่อยู่'], ['load', '📊', 'ภาระสอน'], ['check', '🔍', 'ตรวจสอบตาราง'], ['sep'],
+  ['admin', '⚙️', S.admin ? 'Admin (' + S.admin.name + ')' : 'Admin']
+];
+function renderNav() {
+  const cur = S.page + (S.arg && typeof S.arg === 'string' ? ':' + S.arg : '');
+  $('drawer').innerHTML = NAV().map((n) => n[0] === 'sep' ? '<div class="sep"></div>' :
+    '<a data-go="' + n[0] + '" class="' + (n[0] === cur || (n[0] === S.page && S.page !== 'class') ? 'on' : '') + '">' + n[1] + ' <span>' + esc(n[2]) + '</span></a>').join('');
+}
+function openDrawer(on) { $('drawer').classList.toggle('open', on); $('scrim').classList.toggle('open', on); }
+function fillTerms() {
+  $('termSel').innerHTML = S.boot.terms.map((t) => '<option value="' + t.term_id + '"' + (t.term_id === S.term ? ' selected' : '') + '>' +
+    t.semester + '/' + t.year + (t.is_current ? ' (ปัจจุบัน)' : t.status === 'สิ้นสุด' ? ' (ย้อนหลัง)' : '') + '</option>').join('');
+  $('schoolTitle').textContent = S.boot.system_name || 'ระบบตารางสอน';
+  $('schoolSub').textContent = (S.boot.affiliation || '') + ' · ' + termLabel();
+}
+function printHead(title) {
+  return '<div class="print-head"><b>' + esc(S.boot.school_name) + '</b> · ' + esc(S.boot.affiliation) + '<br>' + esc(title) + '</div>';
+}
+function toolBtns(pdfPayload) {
+  return '<div class="tools"><button class="btn ghost small" data-act="print">🖨️ พิมพ์</button>' +
+    (pdfPayload ? '<button class="btn ghost small" data-act="pdf" data-pdf=\'' + esc(JSON.stringify(pdfPayload)) + '\'>📄 PDF</button>' : '') + '</div>';
+}
+
+const PAGES = {};
+async function go(page, arg) {
+  S.page = page; S.arg = arg === undefined ? null : arg; openDrawer(false); renderNav();
+  const app = $('app');
+  app.innerHTML = loading();
+  try { await PAGES[page](arg); } catch (e) { app.innerHTML = errBox(e); }
+  window.scrollTo(0, 0);
+}
+
+// ---------- ตารางสัปดาห์ (ใช้ร่วมหลายหน้า) ----------
+function periodsOf(td) { return (td.periods || []).slice().sort((a, b) => (a.start_time < b.start_time ? -1 : 1)); }
+const DAYS = [1, 2, 3, 4, 5];
+/** cellFn(day, period) → {s, w, color, cls, attrs} | null */
+function weekGrid(td, cellFn, opts) {
+  opts = opts || {};
+  const ps = periodsOf(td);
+  let html = '<div class="tbl-wrap only-desktop"><table class="tt"><tr><th>เวลา</th>' + DAYS.map((d) => '<th>' + DN[d] + '</th>').join('') + '</tr>';
+  ps.forEach((p) => {
+    const tl = (p.type === 'พัก' ? esc(p.label) : 'คาบ ' + p.period_no) + '<br>' + p.start_time + '–' + p.end_time;
+    if (p.type === 'พัก') { html += '<tr class="brk"><td class="t">' + tl + '</td><td colspan="5">พักกลางวัน</td></tr>'; return; }
+    html += '<tr><td class="t">' + tl + '</td>' + DAYS.map((d) => cellHtml(cellFn(d, p.period_no), d, p.period_no)).join('') + '</tr>';
+  });
+  html += '</table></div>';
+  // มือถือ: แสดงทีละวันเป็นการ์ด
+  const key = opts.key || 'g';
+  const sel = S.classDay[key] || defaultDay();
+  html += '<div class="only-mobile"><div class="tabs">' + DAYS.map((d) => '<button data-day="' + key + ':' + d + '" class="' + (d === sel ? 'on' : '') + '">' + DN[d] + '</button>').join('') + '</div>';
+  DAYS.forEach((d) => {
+    html += '<div class="day-card" data-daycard="' + key + ':' + d + '" style="' + (d === sel ? '' : 'display:none') + '"><h3>วัน' + DN[d] + '</h3>';
+    ps.forEach((p) => {
+      if (p.type === 'พัก') { html += '<div class="pcard"><div class="tm">' + p.start_time + '–' + p.end_time + '</div><div class="bd muted">พักกลางวัน</div></div>'; return; }
+      const c = cellFn(d, p.period_no);
+      html += '<div class="pcard cell ' + (c && c.cls ? c.cls : '') + '" ' + (c && c.attrs ? c.attrs : '') + ' data-d="' + d + '" data-p="' + p.period_no + '" style="' + (c && c.color ? 'background:' + c.color : '') +
+        '"><div class="tm">คาบ ' + p.period_no + '<br>' + p.start_time + '–' + p.end_time + '</div><div class="bd">' +
+        (c ? '<div class="s">' + esc(c.s) + '</div><div class="w">' + (c.wHtml || esc(c.w)) + '</div>' : '<span class="muted">ว่าง</span>') + '</div></div>';
+    });
+    html += '</div>';
+  });
+  return html + '</div>';
+}
+function cellHtml(c, d, p) {
+  return '<td class="cell ' + (c && c.cls ? c.cls : '') + '" ' + (c && c.attrs ? c.attrs : '') + ' data-d="' + d + '" data-p="' + p + '" style="' + (c && c.color ? 'background:' + c.color : '') + '">' +
+    (c ? '<div class="s">' + esc(c.s) + '</div><div class="w">' + (c.wHtml || esc(c.w)) + '</div>' : '') + '</td>';
+}
+function defaultDay() {
+  const iso = S.boot.today; const [y, m, d] = iso.split('-').map(Number);
+  const w = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return w >= 1 && w <= 5 ? w : 1;
+}
+function noPublished() { return '<div class="alert warn">' + esc(termLabel()) + ' ยังไม่มีตารางที่เผยแพร่</div>'; }
+
+// ---------- หน้าหลัก ----------
+PAGES.home = async () => {
+  const d = await api(S.admin ? 'admin.dashboard' : 'public.dashboard');
+  const t = d.term || {};
+  const st = (n, l) => '<div class="stat"><div class="n">' + esc(n) + '</div><div class="l">' + esc(l) + '</div></div>';
+  const day = d.day || {};
+  let h = '<h1 class="page">' + esc(S.boot.system_name) + '</h1>';
+  h += '<div class="card"><b>' + esc(thaiDate(d.date, true)) + '</b><br><span class="muted">' + (t.term_id ? 'ปีการศึกษา ' + t.year + ' ภาคเรียนที่ ' + t.semester : 'ยังไม่ได้ตั้งภาคเรียนปัจจุบัน') +
+    ' · ' + esc(day.is_school_day ? 'วันเรียนปกติ' : (day.day_type || '')) + (day.note ? ' (' + esc(day.note) + ')' : '') + '</span></div>';
+  h += '<div class="grid">' + st(t.year ? t.semester + '/' + t.year : '-', 'ภาคเรียนปัจจุบัน') + st(d.teachers, 'จำนวนครู') + st(d.classes, 'จำนวนชั้น') +
+    st(d.absent_today.length, 'ครูที่ไม่อยู่วันนี้') + st(d.periods_today, 'จำนวนคาบวันนี้') + st(d.subs_today, 'การสอนแทนวันนี้') + st(d.waiting_today, 'รอจัดสอนแทน') + '</div>';
+  const sch = d.schedule;
+  h += '<h2>สถานะตารางสอน</h2><div class="card">';
+  if (sch) {
+    h += 'สถานะ: <span class="badge ' + (sch.status === 'เผยแพร่แล้ว' ? 'b-ok' : sch.status === 'ต้องตรวจสอบใหม่' ? 'b-warn' : 'b-pri') + '">' + esc(sch.status) + '</span>';
+    if (sch.published) h += ' · ฉบับที่ ' + sch.published.version + ' ใช้ตั้งแต่ ' + esc(thaiDate(sch.published.effective_from));
+    h += '<br>การตรวจสอบ: ' + (d.check.ok ? '<span class="badge b-ok">✅ ไม่พบความขัดแย้ง</span>' : '<span class="badge b-err">❌ พบปัญหา ' + d.check.errors + ' รายการ</span>') +
+      (d.check.warnings ? ' <span class="badge b-warn">คำเตือน ' + d.check.warnings + '</span>' : '');
+  }
+  h += '</div>';
+  if (d.alerts.length) h += '<h2>การแจ้งเตือน</h2>' + d.alerts.map((a) => '<div class="alert ' + (a.level === 'error' ? 'err' : 'warn') + '">' + esc(a.text) + '</div>').join('');
+  if (d.absent_today.length) h += '<h2>ครูที่ไม่อยู่วันนี้</h2><div class="card list">' + d.absent_today.map((a) => '<div><b>' + esc(a.name) + '</b> — ' + esc(a.type) + ' · ' + esc(a.periods) + (a.note ? ' · ' + esc(a.note) : '') + '</div>').join('') + '</div>';
+  if (S.admin && d.check.items.length) h += '<h2>รายละเอียดการตรวจ (Admin)</h2><div class="card list">' + d.check.items.map((x) => '<div><span class="badge ' + (x.level === 'ผิด' ? 'b-err' : 'b-warn') + '">' + esc(x.level) + '</span> ' + esc(x.message) + '</div>').join('') + '</div>';
+  h += '<div class="tools"><button class="btn" data-go="teacher">👩‍🏫 ดูตารางของฉัน</button><button class="btn ghost" data-go="daily">📅 ตารางวันนี้</button></div>';
+  $('app').innerHTML = h;
+};
+
+// ---------- ตารางรายวัน ----------
+const STATUS_BADGE = { 'สอนแทน': 'b-sub', 'รอจัดสอนแทน': 'b-warn', 'ยกเลิก': 'b-err', 'กิจกรรมพิเศษ': 'b-pri', 'เปลี่ยนแปลง': 'b-pri' };
+function slotWho(s) {
+  let w = esc(s.teacher || '') + (s.co_teacher ? ' + ' + esc(s.co_teacher) : '');
+  if (s.status !== 'ปกติ') w += ' <span class="badge ' + (STATUS_BADGE[s.status] || '') + '">' + esc(s.status) +
+    (s.original_teacher ? (s.status === 'สอนแทน' ? ' ' : ' (เดิม ') + esc(s.original_teacher) + (s.status === 'สอนแทน' ? '' : ')') : '') + '</span>';
+  if (s.note) w += '<div class="small muted">' + esc(s.note) + '</div>';
+  return w;
+}
+PAGES.daily = async () => {
+  S.dailyDate = S.dailyDate || S.boot.today;
+  const date = S.dailyDate;
+  let h = '<h1 class="page">📅 ตารางรายวัน</h1><div class="card row no-print"><label class="f">เลือกวันที่<input type="date" id="dDate" value="' + date + '"></label>' +
+    '<button class="btn ghost" data-act="dToday">วันนี้</button></div>';
+  $('app').innerHTML = h + loading();
+  const day = await api(S.admin ? 'admin.daily' : 'public.daily', { date: date });
+  h += printHead(thaiDate(date, true)) + '<div class="card"><b>' + esc(thaiDate(date, true)) + '</b><br><span class="muted">' +
+    (day.term_id ? 'ปีการศึกษา ' + day.year + ' ภาคเรียนที่ ' + day.semester : 'ไม่อยู่ในภาคเรียนใด') + ' · ' + esc(day.day_type) + (day.note ? ' · ' + esc(day.note) : '') + '</span>' +
+    (day.version ? '<br><span class="small muted">ตารางฉบับที่ ' + day.version + '</span>' : '') + '</div>';
+  h += toolBtns({ kind: 'daily', date: date });
+  if (day.absent.length) h += '<h2>ครูที่ไม่อยู่</h2><div class="card list">' + day.absent.map((a) => '<div><b>' + esc(a.name) + '</b> — ' + esc(a.type) + ' · ' + esc(a.periods) + (a.note ? ' · ' + esc(a.note) : '') + '</div>').join('') + '</div>';
+  if (day.check && !day.check.ok) h += '<div class="alert err">พบความขัดแย้งในวันนี้\n' + day.check.errors.map((e) => '• ' + e.message).join('\n') + '</div>';
+  if (!day.classes.length) { $('app').innerHTML = h + '<div class="alert info">ไม่มีการเรียนการสอนในวันนี้</div>'; return; }
+  const c = day.counts;
+  h += '<div class="row small" style="margin-bottom:8px"><span class="badge b-sub">สอนแทน ' + c.substituted + '</span><span class="badge b-warn">รอจัดสอนแทน ' + c.waiting + '</span><span class="badge b-err">ยกเลิก ' + c.cancelled + '</span><span class="badge b-pri">เปลี่ยนแปลง ' + c.changed + '</span></div>';
+  const tps = day.periods.filter((p) => p.type === 'คาบเรียน');
+  // จอใหญ่: ชั้น × คาบ
+  h += '<div class="tbl-wrap only-desktop"><table class="tt"><tr><th>ชั้น</th>' + tps.map((p) => '<th>คาบ ' + p.period_no + '<br><span class="small">' + p.start_time + '–' + p.end_time + '</span></th>').join('') + '</tr>';
+  day.classes.forEach((cl) => {
+    h += '<tr><td class="t"><b>' + esc(cl.name) + '</b></td>' + tps.map((p) => {
+      const s = cl.slots.find((x) => x.period === p.period_no);
+      if (!s) return '<td></td>';
+      return '<td class="cell" ' + (S.admin ? 'data-slot="' + s.slot_id + '" style="cursor:pointer;' : 'style="') + 'background:' + (SJ(s.subject_id).color || '#fff') + '"><div class="s">' + esc(s.subject) + '</div><div class="w">' + slotWho(s) + '</div></td>';
+    }).join('') + '</tr>';
+  });
+  h += '</table></div>';
+  // มือถือ: การ์ดรายชั้น
+  h += '<div class="only-mobile">' + day.classes.map((cl) => '<div class="day-card"><h3>' + esc(cl.name) + '</h3>' + cl.slots.map((s) => {
+    const p = tps.find((x) => x.period_no === s.period) || {};
+    return '<div class="pcard" ' + (S.admin ? 'data-slot="' + s.slot_id + '"' : '') + ' style="background:' + (SJ(s.subject_id).color || '#fff') + '"><div class="tm">คาบ ' + s.period + '<br>' + (p.start_time || '') + '–' + (p.end_time || '') + '</div><div class="bd"><div class="s">' + esc(s.subject) + '</div><div class="w">' + slotWho(s) + '</div></div></div>';
+  }).join('') + '</div>').join('') + '</div>';
+  if (S.admin) h += '<p class="small muted no-print">Admin: แตะที่คาบเพื่อยกเลิกคาบ เปลี่ยนเป็นกิจกรรมพิเศษ หรือจัดสอนแทน</p>';
+  $('app').innerHTML = h;
+  S._day = day;
+};
+function slotActions(slotId) {
+  const day = S._day; let cl, s;
+  day.classes.forEach((c) => c.slots.forEach((x) => { if (x.slot_id === slotId) { cl = c; s = x; } }));
+  if (!s) return;
+  let body = '<p><b>' + esc(cl.name) + ' คาบ ' + s.period + '</b> — ' + esc(s.subject) + ' · ' + slotWho(s) + '</p>';
+  if (s.status === 'รอจัดสอนแทน') body += '<div class="alert warn">คาบนี้รอจัดสอนแทน</div><button class="btn" data-act="toSubs">🔄 ไปหน้าจัดสอนแทน</button>';
+  if (s.change_id) body += '<div class="alert info">มีการเปลี่ยนแปลงเฉพาะวันนี้แล้ว</div><label class="f">เหตุผลการยกเลิกการเปลี่ยนแปลง<input id="mReason2"></label><div class="actions"><button class="btn danger" data-act="cancelChange" data-id="' + s.change_id + '">ยกเลิกการเปลี่ยนแปลงนี้</button></div><hr>';
+  body += '<h3>เปลี่ยนแปลงเฉพาะวันนี้</h3><div class="row"><label class="f">ประเภท<select id="mType"><option>ยกเลิกคาบ</option><option>กิจกรรมพิเศษ</option></select></label>' +
+    '<label class="f">วิชา/กิจกรรมใหม่ (ถ้ามี)<select id="mSubj"><option value="">— ไม่เปลี่ยน —</option>' + S.boot.subjects.filter((x) => x.status === 'ใช้งาน').map((x) => '<option value="' + x.subject_id + '">' + esc(x.name) + '</option>').join('') + '</select></label>' +
+    '<label class="f">ครูผู้ดูแล (ถ้ามี)<select id="mTeacher"><option value="">— ไม่เปลี่ยน —</option>' + activeTeachers().map((t) => '<option value="' + t.teacher_id + '">' + esc(t.name) + '</option>').join('') + '</select></label></div>' +
+    '<label class="f">หมายเหตุ (แสดงในตาราง)<input id="mNote" placeholder="เช่น ประชุมผู้ปกครอง"></label><label class="f">เหตุผล (บันทึกใน Log)<input id="mReason"></label>';
+  modal('จัดการคาบ', body, [['บันทึก', async () => {
+    await api('admin.dailyChange', { date: day.date, slot_id: slotId, change_type: $('mType').value, new_subject_id: $('mSubj').value, new_teacher_id: $('mTeacher').value, note: $('mNote').value, reason: $('mReason').value });
+    toast('บันทึกแล้ว'); closeModal(); go('daily');
+  }]]);
+}
+
+// ---------- ตารางครู ----------
+PAGES.teacher = async () => {
+  S.teacherId = S.teacherId || store('teacherId') || '';
+  const opts = activeTeachers().map((t) => '<option value="' + t.teacher_id + '"' + (t.teacher_id === S.teacherId ? ' selected' : '') + '>' + esc(t.name) + '</option>').join('');
+  let h = '<h1 class="page">👩‍🏫 ตารางครู</h1><div class="card row no-print"><label class="f">เลือกครู<select id="tSel"><option value="">— เลือกชื่อครู —</option>' + opts + '</select></label>' +
+    '<div class="tabs" style="margin:0"><button data-tview="week" class="' + (S.teacherView === 'week' ? 'on' : '') + '">ประจำสัปดาห์</button><button data-tview="day" class="' + (S.teacherView === 'day' ? 'on' : '') + '">รายวัน</button></div>' +
+    (S.teacherView === 'day' ? '<label class="f">วันที่<input type="date" id="tDate" value="' + (S.dailyDate || S.boot.today) + '"></label>' : '') + '</div>';
+  if (!S.teacherId) { $('app').innerHTML = h + '<div class="alert info">เลือกชื่อครูเพื่อดูตารางสอน (ระบบจำชื่อไว้ในเครื่องนี้)</div>'; return; }
+  const tid = S.teacherId;
+  $('app').innerHTML = h + loading();
+  if (S.teacherView === 'day') {
+    const date = S.dailyDate || S.boot.today;
+    const day = await api('public.daily', { date: date, teacher_id: tid });
+    h += printHead(tName(tid) + ' · ' + thaiDate(date, true)) + '<div class="card"><b>' + esc(tName(tid)) + '</b><br>' + esc(thaiDate(date, true)) + ' · ' + esc(day.day_type) + '</div>' + toolBtns(null);
+    const mine = day.teacher ? day.teacher.slots : [];
+    const absent = day.absent.find((a) => a.teacher_id === tid);
+    if (absent) h += '<div class="alert warn">วันนี้บันทึกว่าไม่อยู่: ' + esc(absent.type) + ' · ' + esc(absent.periods) + '</div>';
+    if (!day.classes.length) h += '<div class="alert info">ไม่มีการเรียนการสอนในวันนี้</div>';
+    else if (!mine.length) h += '<div class="alert info">ไม่มีคาบสอนในวันนี้</div>';
+    else h += '<div class="day-card"><h3>วัน' + esc(day.day_name) + '</h3>' + mine.map((s) => {
+      const p = day.periods.find((x) => x.period_no === s.period) || {};
+      return '<div class="pcard"><div class="tm">คาบ ' + s.period + '<br>' + (p.start_time || '') + '–' + (p.end_time || '') + '</div><div class="bd"><div class="s">' + esc(s.subject) + '</div><div class="w">' + esc(s.class_name) +
+        (s.role !== 'สอน' ? ' <span class="badge ' + (s.role === 'มีผู้สอนแทน' ? 'b-warn' : 'b-pri') + '">' + esc(s.role) + '</span>' : '') + (s.status !== 'ปกติ' ? ' <span class="badge ' + (STATUS_BADGE[s.status] || '') + '">' + esc(s.status) + '</span>' : '') + '</div></div></div>';
+    }).join('') + '</div>';
+    $('app').innerHTML = h; return;
+  }
+  const [td, m, rep] = await Promise.all([getTermData(S.term), getMaster(S.term), getSubReport(S.term)]);
+  if (!m.version) { $('app').innerHTML = h + noPublished(); return; }
+  const mine = m.slots.filter((s) => s.teacher_id === tid || s.co_teacher_id === tid);
+  const locks = m.locks.filter((l) => l.teacher_ids.split(',').map((x) => x.trim()).includes(tid));
+  h += printHead('ตารางสอน ' + tName(tid) + ' · ' + termLabel()) + '<div class="card"><b>' + esc(tName(tid)) + '</b><br><span class="muted">' + esc(termLabel()) + ' · ' + (mine.length + locks.length) + ' คาบ/สัปดาห์ (สอน ' +
+    mine.filter((s) => s.teacher_id === tid).length + ' · ประกบ ' + mine.filter((s) => s.co_teacher_id === tid).length + ' · กิจกรรม ' + locks.length + ')</span></div>';
+  h += toolBtns({ kind: 'teacher', term_id: S.term, teacher_id: tid });
+  h += weekGrid(td, (d, p) => {
+    const s = mine.find((x) => x.day === d && x.period === p);
+    if (s) return { s: SJ(s.subject_id).name, w: CL(s.class_id).name + (s.co_teacher_id === tid ? ' (ประกบ)' : s.co_teacher_id ? ' + ' + tShort(s.co_teacher_id) : ''), color: SJ(s.subject_id).color };
+    const l = locks.find((x) => x.day === d && x.period === p);
+    return l ? { s: SJ(l.subject_id).name, w: 'กิจกรรมรวม', color: SJ(l.subject_id).color } : null;
+  }, { key: 't' });
+  const r = rep.find((x) => x.teacher_id === tid);
+  if (r && r.count) h += '<h2>การสอนแทนในภาคเรียนนี้ (' + r.count + ' ครั้ง)</h2><div class="card list">' + r.items.map((i) => '<div>' + esc(thaiDate(i.date)) + ' · คาบ ' + i.period + ' · ' + esc(i.class_name) + ' ' + esc(i.subject) + ' · แทน ' + esc(i.replaced) + '</div>').join('') + '</div>';
+  $('app').innerHTML = h;
+};
+
+// ---------- ตารางรายชั้น ----------
+PAGES.class = async (classId) => {
+  const [td, m] = await Promise.all([getTermData(S.term), getMaster(S.term)]);
+  let h = '<h1 class="page">📚 ตารางเรียน ' + esc(CL(classId).name) + '</h1>';
+  if (!m.version) { $('app').innerHTML = h + noPublished(); return; }
+  h += printHead('ตารางเรียน ' + CL(classId).name + ' · ' + termLabel()) + '<div class="card muted">' + esc(termLabel()) + ' · ฉบับที่ ' + m.version + ' ใช้ตั้งแต่ ' + esc(thaiDate(m.effective_from)) + '</div>';
+  h += toolBtns({ kind: 'class', term_id: S.term, class_id: classId });
+  h += weekGrid(td, (d, p) => {
+    const s = m.slots.find((x) => x.class_id === classId && x.day === d && x.period === p);
+    if (!s) return null;
+    return { s: SJ(s.subject_id).name, w: s.teacher_id ? tShort(s.teacher_id) + (s.co_teacher_id ? ' + ' + tShort(s.co_teacher_id) : '') : 'ครูตามกิจกรรม', color: SJ(s.subject_id).color };
+  }, { key: 'c' + classId });
+  $('app').innerHTML = h;
+};
+
+// ---------- ภาพรวม ----------
+PAGES.overview = async () => {
+  S.ov = S.ov || { day: defaultDay(), teacher: '', cls: '' };
+  const o = S.ov;
+  const [td, m] = await Promise.all([getTermData(S.term), getMaster(S.term)]);
+  let h = '<h1 class="page">🏫 ภาพรวมตารางสอนครูทั้งหมด</h1><div class="card row no-print">' +
+    '<label class="f">วัน<select id="ovDay">' + DAYS.map((d) => '<option value="' + d + '"' + (d === o.day ? ' selected' : '') + '>' + DN[d] + '</option>').join('') + '</select></label>' +
+    '<label class="f">ครู<select id="ovT"><option value="">ทุกคน</option>' + activeTeachers().map((t) => '<option value="' + t.teacher_id + '"' + (t.teacher_id === o.teacher ? ' selected' : '') + '>' + esc(t.short_name) + '</option>').join('') + '</select></label>' +
+    '<label class="f">ระดับชั้น<select id="ovC"><option value="">ทุกชั้น</option>' + ttClasses().map((c) => '<option value="' + c.class_id + '"' + (c.class_id === o.cls ? ' selected' : '') + '>' + esc(c.name) + '</option>').join('') + '</select></label>' +
+    '<button class="btn ghost" data-act="ovDate">ดูตามวันที่จริง →</button></div>';
+  if (!m.version) { $('app').innerHTML = h + noPublished(); return; }
+  const tps = periodsOf(td).filter((p) => p.type === 'คาบเรียน');
+  h += printHead('ภาพรวมตารางสอน วัน' + DN[o.day] + ' · ' + termLabel()) + toolBtns({ kind: 'overview', term_id: S.term, day: o.day });
+  const teachers = activeTeachers().filter((t) => !o.teacher || t.teacher_id === o.teacher);
+  const rows = teachers.map((t) => {
+    const cells = tps.map((p) => {
+      const s = m.slots.find((x) => x.day === o.day && x.period === p.period_no && (x.teacher_id === t.teacher_id || x.co_teacher_id === t.teacher_id) && (!o.cls || x.class_id === o.cls));
+      if (s) return '<td style="background:' + (SJ(s.subject_id).color || '#fff') + '"><div class="s">' + esc(CL(s.class_id).name) + '</div><div class="w">' + esc(SJ(s.subject_id).name) + (s.co_teacher_id === t.teacher_id ? ' (ประกบ)' : '') + '</div></td>';
+      const l = !o.cls && m.locks.find((x) => x.day === o.day && x.period === p.period_no && x.teacher_ids.split(',').map((y) => y.trim()).includes(t.teacher_id));
+      return l ? '<td style="background:' + (SJ(l.subject_id).color || '#fff') + '"><div class="w">' + esc(SJ(l.subject_id).name) + '</div></td>' : '<td></td>';
+    });
+    const has = cells.some((c) => c !== '<td></td>');
+    return (o.cls && !has) ? '' : '<tr><td class="t"><b>' + esc(t.short_name) + '</b></td>' + cells.join('') + '</tr>';
+  }).join('');
+  h += '<div class="tbl-wrap only-desktop"><table class="tt"><tr><th>ครู</th>' + tps.map((p) => '<th>คาบ ' + p.period_no + '<br><span class="small">' + p.start_time + '</span></th>').join('') + '</tr>' + (rows || '<tr><td colspan="7" class="muted">ไม่มีข้อมูลตามตัวกรอง</td></tr>') + '</table></div>';
+  // มือถือ: การ์ดรายครู
+  h += '<div class="only-mobile">' + teachers.map((t) => {
+    const items = tps.map((p) => {
+      const s = m.slots.find((x) => x.day === o.day && x.period === p.period_no && (x.teacher_id === t.teacher_id || x.co_teacher_id === t.teacher_id) && (!o.cls || x.class_id === o.cls));
+      const l = !s && !o.cls && m.locks.find((x) => x.day === o.day && x.period === p.period_no && x.teacher_ids.split(',').map((y) => y.trim()).includes(t.teacher_id));
+      if (!s && !l) return '';
+      const sub = s ? SJ(s.subject_id) : SJ(l.subject_id);
+      return '<div class="pcard" style="background:' + (sub.color || '#fff') + '"><div class="tm">คาบ ' + p.period_no + '<br>' + p.start_time + '–' + p.end_time + '</div><div class="bd"><div class="s">' + esc(sub.name) + '</div><div class="w">' + (s ? esc(CL(s.class_id).name) + (s.co_teacher_id === t.teacher_id ? ' (ประกบ)' : '') : 'กิจกรรมรวม') + '</div></div></div>';
+    }).join('');
+    return items ? '<div class="day-card"><h3>' + esc(t.name) + '</h3>' + items + '</div>' : '';
+  }).join('') + '</div>';
+  $('app').innerHTML = h;
+};
+
+// ---------- จัดสอนแทน ----------
+PAGES.subs = async (arg) => {
+  if (arg && arg.date) S.dailyDate = arg.date;
+  const date = S.dailyDate || S.boot.today;
+  let h = '<h1 class="page">🔄 จัดสอนแทน</h1><div class="card row no-print"><label class="f">วันที่<input type="date" id="sDate" value="' + date + '"></label></div>';
+  $('app').innerHTML = h + loading();
+  const day = await api(S.admin ? 'admin.daily' : 'public.daily', { date: date });
+  h += printHead('การสอนแทน ' + thaiDate(date, true)) + '<div class="card"><b>' + esc(thaiDate(date, true)) + '</b> · ' + esc(day.day_type) + '</div>';
+  if (!day.classes.length) { $('app').innerHTML = h + '<div class="alert info">ไม่มีการเรียนการสอนในวันนี้</div>'; return; }
+  const rows = []; day.classes.forEach((c) => c.slots.forEach((s) => { if (s.status === 'สอนแทน' || s.sub_ids.length || s.status === 'รอจัดสอนแทน') rows.push({ c, s }); }));
+  if (S.admin) {
+    const pend = await api('admin.pendingSubs', { date: date });
+    h += '<h2>รอจัดสอนแทน (' + pend.pending.length + ')</h2>';
+    h += pend.pending.length ? '<div class="card list">' + pend.pending.map((p) => '<div class="row" style="justify-content:space-between;align-items:center"><div><b>' + esc(p.class_name) + ' คาบ ' + p.period + '</b> · ' + esc(p.subject) +
+      '<br><span class="small muted">' + esc(p.role) + ' เดิม: ' + esc(tName(p.absent_teacher_id)) + '</span></div><button class="btn small" data-act="suggest" data-slot="' + p.slot_id + '" data-role="' + esc(p.role) + '">เลือกผู้สอนแทน</button></div>').join('') + '</div>'
+      : '<div class="alert ok">ไม่มีคาบที่รอจัดสอนแทน</div>';
+  }
+  const done = rows.filter((r) => r.s.sub_ids.length);
+  h += '<h2>สอนแทนที่ยืนยันแล้ว (' + done.length + ')</h2>' + toolBtns(null);
+  h += done.length ? '<div class="card list">' + done.map((r) => '<div class="row" style="justify-content:space-between;align-items:center"><div><b>' + esc(r.c.name) + ' คาบ ' + r.s.period + '</b> · ' + esc(r.s.subject) +
+    '<br>' + esc(r.s.teacher) + (r.s.original_teacher ? ' <span class="badge b-sub">แทน ' + esc(r.s.original_teacher) + '</span>' : '') + (r.s.original_co_teacher && !r.s.co_teacher ? ' <span class="badge b-sub">ผู้ประกบแทน ' + esc(r.s.original_co_teacher) + '</span>' : '') +
+    '</div>' + (S.admin ? r.s.sub_ids.map((id) => '<button class="btn danger small" data-act="cancelSub" data-id="' + id + '">ยกเลิก</button>').join('') : '') + '</div>').join('') + '</div>' : '<div class="card muted">ยังไม่มี</div>';
+  if (!S.admin) h += '<p class="small muted">การจัดสอนแทนทำโดย Admin</p>';
+  $('app').innerHTML = h;
+};
+async function suggest(slotId, role) {
+  modal('เลือกผู้สอนแทน', loading('กำลังค้นหาครูที่ว่าง…'), []);
+  try {
+    const r = await api('admin.suggestSub', { date: S.dailyDate || S.boot.today, slot_id: slotId, role: role });
+    let b = '<p><b>' + esc(r.class_name) + ' คาบ ' + r.period + '</b> · ' + esc(r.subject) + ' · ' + esc(role) + ' เดิม: ' + esc(tName(r.absent_teacher_id)) + '</p>';
+    b += r.candidates.length ? '<div class="list">' + r.candidates.map((c) => '<div class="row" style="justify-content:space-between;align-items:center"><div>' + c.rank + '. ' + esc(c.label) + '</div><button class="btn ok small" data-act="confirmSub" data-slot="' + slotId + '" data-role="' + esc(role) + '" data-t="' + c.teacher_id + '">ยืนยัน</button></div>').join('') + '</div>'
+      : '<div class="alert warn">ไม่มีครูที่ว่างและผ่านเงื่อนไขในคาบนี้</div>';
+    if (r.excluded.length) b += '<details style="margin-top:10px"><summary>ครูที่จัดไม่ได้ (' + r.excluded.length + ')</summary><div class="list small">' + r.excluded.map((x) => '<div>' + esc(x.name) + ' — ' + esc(x.reasons.join(', ')) + '</div>').join('') + '</div></details>';
+    modalBody(b);
+  } catch (e) { modalBody(errBox(e)); }
+}
+
+// ---------- ครูไม่อยู่ ----------
+PAGES.absence = async () => {
+  S.abs = S.abs || { from: S.boot.today, to: addDays(S.boot.today, 30) };
+  let h = '<h1 class="page">👤 ครูไม่อยู่</h1><div class="card row no-print"><label class="f">ตั้งแต่<input type="date" id="aFrom" value="' + S.abs.from + '"></label><label class="f">ถึง<input type="date" id="aTo" value="' + S.abs.to + '"></label>' +
+    (S.admin ? '<button class="btn" data-act="absForm">+ บันทึกครูไม่อยู่</button>' : '') + '</div>';
+  $('app').innerHTML = h + loading();
+  const list = await api(S.admin ? 'admin.absences' : 'public.absences', { from: S.abs.from, to: S.abs.to });
+  h += printHead('ครูไม่อยู่ ' + thaiDate(S.abs.from) + ' – ' + thaiDate(S.abs.to)) + toolBtns(null);
+  h += list.length ? '<div class="tbl-wrap"><table class="data"><tr><th>วันที่</th><th>ครู</th><th>ประเภท</th><th>ช่วงเวลา</th>' + (S.admin ? '<th>หมายเหตุ</th><th></th>' : '') + '</tr>' +
+    list.map((a) => '<tr><td>' + esc(thaiDate(a.date, true)) + '</td><td>' + esc(a.name) + '</td><td>' + esc(a.type) + '</td><td>' + esc(a.periods) + '</td>' +
+      (S.admin ? '<td>' + esc(a.note) + '</td><td><button class="btn danger small" data-act="cancelAbs" data-id="' + a.absence_id + '">ยกเลิก</button></td>' : '') + '</tr>').join('') + '</table></div>'
+    : '<div class="card muted">ไม่มีรายการในช่วงนี้</div>';
+  $('app').innerHTML = h;
+};
+function absenceForm() {
+  const tps = [1, 2, 3, 4, 5, 6];
+  const b = '<div class="row"><label class="f">วันที่<input type="date" id="fDate" value="' + (S.dailyDate || S.boot.today) + '"></label><label class="f">ถึงวันที่ (ถ้าหลายวัน)<input type="date" id="fTo"></label></div>' +
+    '<label class="f">ครู<select id="fT"><option value="">— เลือกครู —</option>' + activeTeachers().map((t) => '<option value="' + t.teacher_id + '">' + esc(t.name) + '</option>').join('') + '</select></label>' +
+    '<label class="f">ประเภท<select id="fType">' + ['ลาป่วย', 'ลากิจ', 'ลาพักผ่อน', 'อบรม', 'ไปราชการ', 'ติดภารกิจ', 'อื่น ๆ'].map((x) => '<option>' + x + '</option>').join('') + '</select></label>' +
+    '<label style="display:flex;gap:8px;align-items:center;margin:10px 0"><input type="checkbox" id="fWhole" checked> ทั้งวัน</label>' +
+    '<div class="row" id="fPeriods" style="display:none"><label class="f">ตั้งแต่คาบ<select id="fP1">' + tps.map((p) => '<option>' + p + '</option>').join('') + '</select></label><label class="f">ถึงคาบ<select id="fP2">' + tps.map((p) => '<option>' + p + '</option>').join('') + '</select></label></div>' +
+    '<label class="f">หมายเหตุ (เห็นเฉพาะ Admin)<input id="fNote"></label>';
+  modal('บันทึกครูไม่อยู่', b, [['บันทึก', async () => {
+    const whole = $('fWhole').checked;
+    const r = await api('admin.saveAbsence', { date: $('fDate').value, date_to: $('fTo').value || '', teacher_id: $('fT').value, type: $('fType').value, whole_day: whole,
+      period_from: whole ? '' : $('fP1').value, period_to: whole ? '' : $('fP2').value, note: $('fNote').value, reason: $('fNote').value || 'บันทึกครูไม่อยู่' });
+    closeModal(); toast('บันทึกแล้ว ' + r.saved.length + ' วัน' + (r.skipped.length ? ' (ข้ามวันหยุด ' + r.skipped.length + ' วัน)' : '')); clearCache(); go('absence');
+  }]]);
+  $('fWhole').addEventListener('change', () => { $('fPeriods').style.display = $('fWhole').checked ? 'none' : 'flex'; });
+}
+
+// ---------- ภาระสอน ----------
+PAGES.load = async () => {
+  const [td, rep] = await Promise.all([getTermData(S.term), getSubReport(S.term)]);
+  let h = '<h1 class="page">📊 ภาระสอน</h1>' + printHead('ภาระสอน ' + termLabel()) + '<div class="card muted">' + esc(termLabel()) + ' · คิดจากโครงสร้างคาบเรียน</div>' + toolBtns({ kind: 'subs', term_id: S.term });
+  h += '<div class="tbl-wrap"><table class="data"><tr><th>ครู</th><th>สอน</th><th>ประกบ</th><th>กิจกรรม</th><th>รวม/สัปดาห์</th><th>สอนแทน (ภาคนี้)</th></tr>' + td.loads.map((l) => {
+    const r = rep.find((x) => x.teacher_id === l.teacher_id) || { count: 0 };
+    return '<tr><td>' + esc(tName(l.teacher_id)) + '</td><td>' + l.teach + '</td><td>' + l.co + '</td><td>' + l.activity + '</td><td><b>' + l.total + '</b></td><td>' + r.count + '</td></tr>';
+  }).join('') + '</table></div>';
+  const withSubs = rep.filter((r) => r.count);
+  h += '<h2>รายละเอียดการสอนแทน</h2>' + (withSubs.length ? withSubs.map((r) => '<div class="card"><b>' + esc(r.name) + '</b> — ' + r.count + ' ครั้ง<div class="list small">' +
+    r.items.map((i) => '<div>' + esc(thaiDate(i.date)) + ' · คาบ ' + i.period + ' · ' + esc(i.class_name) + ' ' + esc(i.subject) + ' · แทน ' + esc(i.replaced) + (i.role === 'ผู้ประกบ' ? ' (ประกบ)' : '') + '</div>').join('') + '</div></div>').join('') : '<div class="card muted">ยังไม่มีการสอนแทนในภาคเรียนนี้</div>');
+  $('app').innerHTML = h;
+};
+
+// ---------- ตรวจสอบตาราง ----------
+PAGES.check = async () => {
+  const td = await getTermData(S.term);
+  const t = termObj();
+  let h = '<h1 class="page">🔍 ตรวจสอบตาราง</h1><div class="card"><b>' + esc(termLabel()) + '</b> · สถานะตาราง: <span class="badge b-pri">' + esc(t.schedule_status) + '</span>' +
+    '<div class="list" style="margin-top:8px">' + td.summary.map((s) => '<div>' + (s.diff === 0 ? '✅ ' : '⚠️ ') + esc(s.label) + '</div>').join('') + '</div></div>';
+  if (!S.admin) { $('app').innerHTML = h + '<p class="muted small">การจัด ตรวจสอบ และเผยแพร่ตารางทำโดย Admin</p>'; return; }
+  h += '<div class="tools"><button class="btn" data-act="gen">⚙️ จัดตารางอัตโนมัติ</button><button class="btn ghost" data-act="checkAll">🔍 ตรวจสอบตารางทั้งหมด</button><button class="btn ok" data-act="publish">📢 เผยแพร่ตาราง</button></div><div id="chkOut"></div>';
+  $('app').innerHTML = h + loading('กำลังโหลดฉบับร่าง…');
+  const [pre, vers, draft] = await Promise.all([api('admin.preChecks', { term_id: S.term }), api('admin.versions', { term_id: S.term }), api('admin.draft', { term_id: S.term })]);
+  h += '<h2>ตรวจข้อมูลก่อนจัดตาราง</h2><div class="card">' + (pre.ok ? '<div class="alert ok">✅ ข้อมูลพร้อมสำหรับจัดตาราง</div>' : '<div class="alert err">❌ พบปัญหา ' + pre.errors.length + ' รายการ — ยังจัดตารางไม่ได้</div>') +
+    '<div class="list small">' + pre.errors.concat(pre.warnings).map((x) => '<div><span class="badge ' + (x.level === 'ผิด' ? 'b-err' : 'b-warn') + '">' + esc(x.level) + '</span> ' + esc(x.message) + '</div>').join('') + '</div></div>';
+  h += '<h2>ฉบับของตาราง</h2><div class="card list small">' + (vers.length ? vers.slice().reverse().map((v) => '<div>ฉบับที่ ' + v.version + ' · <span class="badge ' + (v.status === 'เผยแพร่แล้ว' ? 'b-ok' : v.status === 'ร่าง' ? 'b-pri' : '') + '">' + esc(v.status) + '</span>' + (v.effective_from ? ' · ใช้ตั้งแต่ ' + esc(thaiDate(v.effective_from)) : '') + ' · ' + v.count + ' คาบ</div>').join('') : '<div>ยังไม่มี</div>') + '</div>';
+  if (draft.version) {
+    S._draft = draft; S.editClass = S.editClass || ttClasses()[0].class_id; S.editSel = null; S.editOpts = null;
+    h += '<h2>แก้ฉบับร่าง (ฉบับที่ ' + draft.version + ')</h2><div class="card small">' + (draft.check.ok ? '✅ ไม่พบความขัดแย้ง' : '❌ พบความขัดแย้ง ' + draft.check.errors.length + ' รายการ') +
+      ' · แตะคาบที่ต้องการย้าย แล้วแตะช่องสีเขียวเพื่อสลับ (ช่องจาง = สลับไม่ได้ แตะเพื่อดูเหตุผล)</div><div class="tabs">' +
+      ttClasses().map((c) => '<button data-edcls="' + c.class_id + '" class="' + (c.class_id === S.editClass ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div><div id="edGrid"></div>';
+  }
+  $('app').innerHTML = h;
+  if (draft.version) renderEditGrid(td);
+};
+function renderEditGrid(td) {
+  td = td || S._td; S._td = td;
+  const d = S._draft, cls = S.editClass, sel = S.editSel, opts = S.editOpts || [];
+  $('edGrid').innerHTML = weekGrid(td, (day, p) => {
+    const s = d.slots.find((x) => x.class_id === cls && x.day === day && x.period === p);
+    if (!s) return null;
+    let c = '';
+    if (sel && sel.d === day && sel.p === p) c = 'sel';
+    else if (sel) { const o = opts.find((x) => x.day === day && x.period === p); c = o ? (o.ok ? 'can' : 'cant') : ''; }
+    return { s: SJ(s.subject_id).name, w: s.teacher_id ? tShort(s.teacher_id) + (s.co_teacher_id ? ' + ' + tShort(s.co_teacher_id) : '') : 'ครูตามกิจกรรม' + (s.source === 'ล็อก' ? ' 🔒' : ''),
+      color: SJ(s.subject_id).color, cls: c + ' ed', attrs: 'style="cursor:pointer"' };
+  }, { key: 'ed' });
+}
+async function editTap(day, p) {
+  const d = S._draft, cls = S.editClass;
+  const s = d.slots.find((x) => x.class_id === cls && x.day === day && x.period === p);
+  if (!S.editSel) {
+    if (s && s.source === 'ล็อก') { toast('กิจกรรมล็อกเวลาย้ายไม่ได้'); return; }
+    S.editSel = { d: day, p: p }; S.editOpts = null; renderEditGrid(); toast('กำลังตรวจช่องที่สลับได้…', 8000);
+    S.editOpts = await api('admin.swapOptions', { term_id: S.term, class_id: cls, day: day, period: p });
+    renderEditGrid(); toast('ช่องสีเขียว = สลับได้'); return;
+  }
+  if (S.editSel.d === day && S.editSel.p === p) { S.editSel = null; S.editOpts = null; renderEditGrid(); return; }
+  const o = (S.editOpts || []).find((x) => x.day === day && x.period === p);
+  if (!o) return;
+  if (!o.ok) { modal('สลับไม่ได้', '<div class="alert err">' + o.reasons.map(esc).join('\n') + '</div>', []); return; }
+  const a = S.editSel;
+  modal('ยืนยันการสลับคาบ', '<p>สลับ ' + esc(CL(cls).name) + ' วัน' + DN[a.d] + ' คาบ ' + a.p + ' กับ วัน' + DN[day] + ' คาบ ' + p + '</p><label class="f">เหตุผล<input id="swR"></label>', [['สลับและบันทึกเป็นฉบับร่างใหม่', async () => {
+    await api('admin.editDraft', { term_id: S.term, ops: [{ class_id: cls, a: { day: a.d, period: a.p }, b: { day: day, period: p } }], reason: $('swR').value || 'แก้ตารางด้วยมือ' });
+    closeModal(); toast('บันทึกแล้ว'); go('check');
+  }]]);
+}
+
+// ---------- Admin ----------
+const TABLE_ORDER = ['Teachers', 'Subjects', 'Classes', 'TeacherSubjects', 'Requirements', 'Locks', 'TeacherBlocks', 'Periods', 'Calendar', 'Terms', 'Settings'];
+PAGES.admin = async () => {
+  if (!S.admin) {
+    $('app').innerHTML = '<h1 class="page">⚙️ Admin</h1><div class="card" style="max-width:420px"><label class="f">ชื่อผู้ใช้<input id="lu" autocomplete="username"></label><label class="f">รหัสผ่าน<input id="lp" type="password" autocomplete="current-password"></label>' +
+      '<div class="tools"><button class="btn" data-act="login">เข้าสู่ระบบ</button></div><p class="small muted">ตั้งชื่อผู้ใช้และรหัสผ่านได้จากเมนู "ระบบตารางสอน" ใน Google Sheets (เจ้าของไฟล์เท่านั้น)</p></div>';
+    return;
+  }
+  S.schema = S.schema || await api('admin.schema');
+  S.adm = S.adm || { tab: 'data', table: 'Teachers' };
+  const tabs = [['data', 'ข้อมูลพื้นฐาน'], ['terms', 'ภาคเรียน'], ['log', 'Log การแก้ไข'], ['sys', 'ระบบ']];
+  let h = '<h1 class="page">⚙️ Admin</h1><div class="tabs">' + tabs.map((t) => '<button data-atab="' + t[0] + '" class="' + (S.adm.tab === t[0] ? 'on' : '') + '">' + t[1] + '</button>').join('') + '</div><div id="admBody">' + loading() + '</div>';
+  $('app').innerHTML = h;
+  const body = $('admBody');
+  if (S.adm.tab === 'data') {
+    const def = S.schema.tables[S.adm.table];
+    const rows = await api('admin.table', { table: S.adm.table, term_id: S.term });
+    let b = '<div class="card row"><label class="f">แผ่นข้อมูล<select id="admTable">' + TABLE_ORDER.map((t) => '<option value="' + t + '"' + (t === S.adm.table ? ' selected' : '') + '>' + esc(S.schema.tables[t].sheet) + '</option>').join('') + '</select></label>' +
+      '<button class="btn" data-act="addRow">+ เพิ่มรายการ</button></div>';
+    const hasTerm = def.cols.some((c) => c.k === 'term_id') && S.adm.table !== 'Terms';
+    if (hasTerm) b += '<div class="small muted">แสดงเฉพาะ ' + esc(termLabel()) + ' (เปลี่ยนภาคเรียนที่มุมขวาบน)</div>';
+    const cols = def.cols.filter((c) => c.k !== 'term_id' || !hasTerm).slice(0, 9);
+    b += '<div class="tbl-wrap"><table class="data"><tr>' + cols.map((c) => '<th>' + esc(c.label) + '</th>').join('') + '</tr>' + rows.map((r, i) => '<tr class="click" data-row="' + i + '">' + cols.map((c) => '<td>' + esc(showVal(c, r[c.k])) + '</td>').join('') + '</tr>').join('') + '</table></div>';
+    b += '<p class="small muted">' + rows.length + ' รายการ · แตะแถวเพื่อแก้ไข · ทุกการแก้ไขถูกตรวจและบันทึกใน Log</p>';
+    body.innerHTML = b; S._rows = rows;
+  } else if (S.adm.tab === 'terms') {
+    let b = '<div class="card list">' + S.boot.terms.map((t) => '<div class="row" style="justify-content:space-between;align-items:center"><div><b>' + t.semester + '/' + t.year + '</b> · ' + esc(t.status) + (t.is_current ? ' · <span class="badge b-ok">ปัจจุบัน</span>' : '') +
+      '<br><span class="small muted">' + (t.start_date ? esc(thaiDate(t.start_date)) + ' – ' + esc(thaiDate(t.end_date)) : 'ยังไม่กำหนดวันเปิด-ปิดภาค') + ' · ตาราง: ' + esc(t.schedule_status) + '</span></div>' +
+      (t.is_current ? '' : '<button class="btn ghost small" data-act="setCurrent" data-id="' + t.term_id + '">ตั้งเป็นภาคเรียนปัจจุบัน</button>') + '</div>').join('') + '</div>';
+    b += '<h2>สร้างภาคเรียนใหม่จากภาคเรียนเดิม</h2><div class="card"><div class="row"><label class="f">คัดลอกจาก<select id="ctFrom">' + S.boot.terms.map((t) => '<option value="' + t.term_id + '"' + (t.term_id === S.term ? ' selected' : '') + '>' + t.semester + '/' + t.year + '</option>').join('') + '</select></label>' +
+      '<label class="f">ปีการศึกษา (พ.ศ.)<input id="ctY" type="number" value="' + (termObj().semester === 2 ? termObj().year + 1 : termObj().year) + '"></label><label class="f">ภาคเรียน<select id="ctS"><option>1</option><option>2</option></select></label></div>' +
+      '<div class="row"><label class="f">วันเปิดภาค<input type="date" id="ctA"></label><label class="f">วันปิดภาค<input type="date" id="ctB"></label></div>' +
+      '<p class="small muted">คัดลอกเวลาเรียน โครงสร้างคาบ กิจกรรมล็อก และเวลาไม่ว่างของครู — ข้อมูลของภาคเรียนต้นทางไม่ถูกแก้ไข</p><button class="btn" data-act="copyTerm">สร้างภาคเรียน</button></div>';
+    body.innerHTML = b;
+  } else if (S.adm.tab === 'log') {
+    const log = await api('admin.log', { limit: 200 });
+    body.innerHTML = '<div class="tbl-wrap"><table class="data"><tr><th>วันเวลา</th><th>ผู้แก้ไข</th><th>ประเภท</th><th>แผ่นงาน</th><th>รายการ</th><th>เหตุผล</th><th>รายการเดิม → ใหม่</th></tr>' + log.map((l) =>
+      '<tr><td>' + esc(l.timestamp) + '</td><td>' + esc(l.user) + '</td><td>' + esc(l.action) + '</td><td>' + esc(l.sheet) + '</td><td>' + esc(l.record_id) + '</td><td>' + esc(l.reason) + '</td><td class="small">' + esc((l.old_value || '').slice(0, 160)) + ' → ' + esc((l.new_value || '').slice(0, 160)) + '</td></tr>').join('') + '</table></div>';
+  } else {
+    body.innerHTML = '<div class="card"><p>เข้าสู่ระบบในชื่อ <b>' + esc(S.admin.name) + '</b></p><div class="tools"><button class="btn ghost" data-act="backup">💾 สำรองข้อมูลตอนนี้</button><button class="btn danger" data-act="logout">ออกจากระบบ</button></div>' +
+      '<p class="small muted">เพิ่ม/เปลี่ยนรหัสผ่าน Admin ได้จากเมนู "ระบบตารางสอน" ใน Google Sheets · การสำรองอัตโนมัติรายวันเปิดได้จากเมนูเดียวกัน</p></div>';
+  }
+};
+function refName(ref, v) {
+  if (!v) return '';
+  if (ref === 'Teachers') return tShort(v); if (ref === 'Subjects') return SJ(v).name; if (ref === 'Classes') return CL(v).name;
+  if (ref === 'Terms') { const t = termObj(v); return t.term_id ? t.semester + '/' + t.year : v; }
+  return v;
+}
+function showVal(c, v) {
+  if (c.type === 'bool') return v ? '✓' : '';
+  if (c.ref) return refName(c.ref, v);
+  if (c.k === 'class_ids') return String(v || '').split(',').map((x) => CL(x.trim()).name).join(', ');
+  if (c.k === 'teacher_ids') return String(v || '').split(',').filter(Boolean).map((x) => tShort(x.trim())).join(', ');
+  if (c.k === 'day') return DN[v] || v;
+  return v;
+}
+function refOptions(ref, val, required) {
+  let list = [];
+  if (ref === 'Teachers') list = S.boot.teachers.map((t) => [t.teacher_id, t.name + (t.status !== 'ใช้งาน' ? ' (ไม่ใช้งาน)' : '')]);
+  if (ref === 'Subjects') list = S.boot.subjects.map((s) => [s.subject_id, s.name]);
+  if (ref === 'Classes') list = S.boot.classes.map((c) => [c.class_id, c.name]);
+  if (ref === 'Terms') list = S.boot.terms.map((t) => [t.term_id, t.semester + '/' + t.year]);
+  return (required ? '' : '<option value="">— ไม่มี —</option>') + list.map((o) => '<option value="' + esc(o[0]) + '"' + (o[0] === val ? ' selected' : '') + '>' + esc(o[1]) + '</option>').join('');
+}
+function rowForm(rec) {
+  const def = S.schema.tables[S.adm.table], isNew = !rec;
+  rec = rec || {};
+  let b = '';
+  def.cols.forEach((c) => {
+    let v = rec[c.k]; if (v === null || v === undefined) v = '';
+    if (isNew && c.k === 'term_id') v = S.term;
+    const id = 'ff_' + c.k, req = c.required ? ' *' : '';
+    if (c.k === def.key && def.auto_id && isNew) return;
+    if (c.k === def.key && !isNew) { b += '<label class="f">' + esc(c.label) + '<input id="' + id + '" value="' + esc(v) + '" disabled></label>'; return; }
+    if (S.adm.table === 'Terms' && c.k === 'term_id') return;
+    if (S.adm.table === 'Terms' && c.k === 'is_current') return;
+    if (S.adm.table === 'Periods' && c.k === 'period_id' && isNew) return;
+    let input;
+    if (c.type === 'bool') input = '<input type="checkbox" id="' + id + '"' + (v === true ? ' checked' : '') + '>';
+    else if (c.options) input = '<select id="' + id + '">' + (c.required ? '' : '<option value=""></option>') + c.options.map((o) => '<option' + (o === v ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>';
+    else if (c.ref) input = '<select id="' + id + '">' + refOptions(c.ref, v, c.required) + '</select>';
+    else if (c.k === 'day') input = '<select id="' + id + '">' + [1, 2, 3, 4, 5].map((d) => '<option value="' + d + '"' + (Number(v) === d ? ' selected' : '') + '>' + DN[d] + '</option>').join('') + '</select>';
+    else if (c.type === 'date') input = '<input type="date" id="' + id + '" value="' + esc(v) + '">';
+    else if (c.type === 'time') input = '<input type="time" id="' + id + '" value="' + esc(v) + '">';
+    else if (c.type === 'int') input = '<input type="number" id="' + id + '" value="' + esc(v) + '">';
+    else input = '<input id="' + id + '" value="' + esc(v) + '"' + (c.type === 'list' ? ' placeholder="เช่น 1-3 หรือ 1,3,5 (ว่าง = ไม่จำกัด)"' : c.k === 'class_ids' ? ' placeholder="เช่น P1,P2"' : c.k === 'teacher_ids' ? ' placeholder="เช่น T01,T03"' : '') + '>';
+    b += c.type === 'bool' ? '<label style="display:flex;gap:8px;align-items:center;margin:8px 0">' + input + ' ' + esc(c.label) + '</label>' : '<label class="f">' + esc(c.label + req) + input + '</label>';
+  });
+  const t = termObj(rec.term_id || S.term);
+  b += '<label class="f">เหตุผลการแก้ไข (บันทึกใน Log)<input id="ff__reason"></label>';
+  if (t.status === 'สิ้นสุด' && S.adm.table !== 'Terms') b += '<label class="f">ภาคเรียนนี้สิ้นสุดแล้ว — เหตุผลการปลดล็อก<input id="ff__unlock"></label>';
+  const actions = [['บันทึก', async () => {
+    const out = {};
+    def.cols.forEach((c) => {
+      const el = $('ff_' + c.k); if (!el) return;
+      if (c.k === def.key && !isNew) { out[c.k] = rec[c.k]; return; }
+      out[c.k] = c.type === 'bool' ? el.checked : el.value;
+    });
+    if (S.adm.table === 'Terms' && !isNew) out.term_id = rec.term_id;
+    await api('admin.save', { table: S.adm.table, record: out, reason: $('ff__reason').value, unlockReason: $('ff__unlock') ? $('ff__unlock').value : '' });
+    closeModal(); toast('บันทึกแล้ว'); await reloadBoot(); go('admin');
+  }]];
+  if (!isNew && !def.no_delete) actions.unshift(['ลบ', async () => {
+    const reason = $('ff__reason').value; if (!reason) throw new Error('กรุณาระบุเหตุผลการลบ');
+    await api('admin.delete', { table: S.adm.table, id: rec[def.key], reason: reason, unlockReason: $('ff__unlock') ? $('ff__unlock').value : '' });
+    closeModal(); toast('ลบแล้ว'); await reloadBoot(); go('admin');
+  }, 'danger']);
+  modal((isNew ? 'เพิ่ม' : 'แก้ไข') + ' · ' + def.sheet, b, actions);
+}
+
+// ---------- หน้าต่าง / PDF ----------
+function modal(title, body, actions) {
+  closeModal();
+  const bg = document.createElement('div'); bg.className = 'modal-bg'; bg.id = 'modalBg';
+  bg.innerHTML = '<div class="modal" role="dialog"><h3>' + esc(title) + '</h3><div id="modalBody">' + body + '</div><div id="modalErr"></div><div class="actions">' +
+    '<button class="btn ghost" data-act="close">ปิด</button>' + actions.map((a, i) => '<button class="btn ' + (a[2] || '') + '" data-mact="' + i + '">' + esc(a[0]) + '</button>').join('') + '</div></div>';
+  document.body.appendChild(bg);
+  bg.addEventListener('click', async (ev) => {
+    if (ev.target === bg) return closeModal();
+    const b = ev.target.closest('[data-mact]'); if (!b) return;
+    b.disabled = true; $('modalErr').innerHTML = '';
+    try { await actions[Number(b.dataset.mact)][1](); } catch (e) { $('modalErr').innerHTML = errBox(e); b.disabled = false; }
+  });
+}
+function modalBody(html) { const m = $('modalBody'); if (m) m.innerHTML = html; }
+function closeModal() { const m = $('modalBg'); if (m) m.remove(); }
+async function makePdf(payload) {
+  modal('สร้างไฟล์ PDF', loading('กำลังสร้าง PDF ขนาด A4…'), []);
+  try {
+    const r = await api('public.pdf', payload);
+    const bin = atob(r.base64), arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([arr], { type: 'application/pdf' }));
+    modalBody('<p>ไฟล์พร้อมแล้ว: <b>' + esc(r.filename) + '</b></p><div class="tools"><a class="btn" href="' + url + '" download="' + esc(r.filename) + '">⬇️ ดาวน์โหลด PDF</a>' +
+      (r.url ? '<a class="btn ghost" href="' + esc(r.url) + '" target="_blank" rel="noopener">เปิดใน Google Drive</a>' : '') + '</div><p class="small muted">ถ้าดาวน์โหลดไม่ได้บนมือถือ ให้กด "เปิดใน Google Drive" หรือใช้ปุ่ม 🖨️ พิมพ์ แล้วเลือก "บันทึกเป็น PDF"</p>');
+  } catch (e) { modalBody(errBox(e)); }
+}
+
+// ---------- เข้าสู่ระบบ ----------
+function setAdmin(a) {
+  S.admin = a; sstore('adm', a ? JSON.stringify(a) : null); clearCache(); S.schema = null; renderNav();
+}
+
+// ---------- เหตุการณ์ ----------
+document.addEventListener('click', async (ev) => {
+  const el = ev.target.closest('[data-go],[data-act],[data-day],[data-tview],[data-slot],[data-atab],[data-row],[data-edcls],.cell.ed');
+  if (!el || el.closest('.modal-bg') && !el.dataset.act) return;
+  try {
+    if (el.dataset.go) { const [p, a] = el.dataset.go.split(':'); return go(p, a); }
+    if (el.dataset.day) {
+      const [k, d] = el.dataset.day.split(':'); S.classDay[k] = Number(d);
+      const root = el.closest('.only-mobile');
+      root.querySelectorAll('[data-day]').forEach((b) => b.classList.toggle('on', b === el));
+      root.querySelectorAll('[data-daycard]').forEach((c) => (c.style.display = c.dataset.daycard === k + ':' + d ? '' : 'none'));
+      return;
+    }
+    if (el.dataset.tview) { S.teacherView = el.dataset.tview; return go('teacher'); }
+    if (el.dataset.atab) { S.adm.tab = el.dataset.atab; return go('admin'); }
+    if (el.dataset.edcls) { S.editClass = el.dataset.edcls; S.editSel = null; S.editOpts = null; document.querySelectorAll('[data-edcls]').forEach((b) => b.classList.toggle('on', b === el)); return renderEditGrid(); }
+    if (el.classList.contains('ed')) return editTap(Number(el.dataset.d), Number(el.dataset.p));
+    if (el.dataset.row !== undefined && S.page === 'admin') return rowForm(S._rows[Number(el.dataset.row)]);
+    if (el.dataset.slot && !el.dataset.act && S.admin && S.page === 'daily') return slotActions(el.dataset.slot);
+    const act = el.dataset.act;
+    if (!act) return;
+    if (act === 'close') return closeModal();
+    if (act === 'print') return window.print();
+    if (act === 'pdf') return makePdf(JSON.parse(el.dataset.pdf));
+    if (act === 'dToday') { S.dailyDate = S.boot.today; return go('daily'); }
+    if (act === 'ovDate') { S.dailyDate = S.dailyDate || S.boot.today; return go('daily'); }
+    if (act === 'toSubs') { closeModal(); return go('subs', { date: S.dailyDate }); }
+    if (act === 'login') {
+      el.disabled = true;
+      try { const r = await api('auth.login', { username: $('lu').value, password: $('lp').value }); setAdmin({ token: r.token, name: r.name, username: r.username }); toast('ยินดีต้อนรับ ' + r.name); go('admin'); }
+      catch (e) { el.disabled = false; $('app').insertAdjacentHTML('beforeend', errBox(e)); }
+      return;
+    }
+    if (act === 'logout') { await api('auth.logout').catch(() => {}); setAdmin(null); return go('home'); }
+    if (act === 'backup') { toast('กำลังสำรองข้อมูล…', 10000); const r = await api('admin.backupNow'); return toast('สำรองแล้ว: ' + r.file_name, 5000); }
+    if (act === 'addRow') return rowForm(null);
+    if (act === 'absForm') return absenceForm();
+    if (act === 'cancelAbs') return modal('ยกเลิกรายการครูไม่อยู่', '<p>การสอนแทนที่เกี่ยวข้องจะถูกยกเลิกด้วย</p><label class="f">เหตุผล<input id="cR"></label>', [['ยืนยันยกเลิก', async () => {
+      const r = await api('admin.cancelAbsence', { absence_id: el.dataset.id, reason: $('cR').value }); closeModal(); toast('ยกเลิกแล้ว (ยกเลิกการสอนแทน ' + r.cancelled_substitutions + ' รายการ)'); clearCache(); go('absence'); }, 'danger']]);
+    if (act === 'suggest') return suggest(el.dataset.slot, el.dataset.role);
+    if (act === 'confirmSub') {
+      el.disabled = true;
+      try { await api('admin.confirmSub', { date: S.dailyDate || S.boot.today, slot_id: el.dataset.slot, role: el.dataset.role, substitute_teacher_id: el.dataset.t }); closeModal(); toast('ยืนยันผู้สอนแทนแล้ว'); clearCache(); return go('subs'); }
+      catch (e) { el.disabled = false; return modalBody(errBox(e)); }
+    }
+    if (act === 'cancelSub') return modal('ยกเลิกการสอนแทน', '<label class="f">เหตุผล<input id="cR"></label>', [['ยืนยันยกเลิก', async () => {
+      await api('admin.cancelSub', { sub_id: el.dataset.id, reason: $('cR').value }); closeModal(); toast('ยกเลิกแล้ว'); clearCache(); go('subs'); }, 'danger']]);
+    if (act === 'cancelChange') { await api('admin.cancelDailyChange', { change_id: el.dataset.id, reason: $('mReason2').value }); closeModal(); toast('ยกเลิกแล้ว'); return go('daily'); }
+    if (act === 'setCurrent') return modal('ตั้งภาคเรียนปัจจุบัน', '<p>ตั้ง ' + esc(el.dataset.id) + ' เป็นภาคเรียนปัจจุบัน?</p><label class="f">เหตุผล<input id="cR"></label>', [['ยืนยัน', async () => {
+      await api('admin.setCurrentTerm', { term_id: el.dataset.id, reason: $('cR').value }); closeModal(); await reloadBoot(); S.term = el.dataset.id; fillTerms(); toast('เปลี่ยนแล้ว'); go('admin'); }]]);
+    if (act === 'copyTerm') {
+      el.disabled = true;
+      try {
+        const r = await api('admin.createTermFromTerm', { from_term_id: $('ctFrom').value, target: { year: Number($('ctY').value), semester: Number($('ctS').value), start_date: $('ctA').value, end_date: $('ctB').value } });
+        await reloadBoot(); modal('สร้างภาคเรียนแล้ว', '<p>' + esc(r.term_id) + ' · คัดลอกโครงสร้าง ' + r.counts.requirements + ' แถว</p>' + (r.warnings.length ? '<div class="alert warn">' + r.warnings.map(esc).join('\n') + '</div>' : ''), []);
+      } catch (e) { el.disabled = false; $('admBody').insertAdjacentHTML('beforeend', errBox(e)); }
+      return;
+    }
+    if (act === 'gen') {
+      $('chkOut').innerHTML = loading('กำลังจัดตาราง (อาจใช้เวลาสักครู่)…');
+      try { const r = await api('admin.generateAndSave', { term_id: S.term }); clearCache(); toast('จัดตารางเสร็จ: ฉบับร่าง ' + r.version); await go('check'); $('chkOut').innerHTML = '<div class="alert ok">✅ จัดตารางเสร็จ บันทึกเป็นฉบับร่าง ' + r.version + ' (' + r.count + ' คาบ)\n' + (r.notes || []).map(esc).join('\n') + '</div>'; }
+      catch (e) { $('chkOut').innerHTML = errBox(e); }
+      return;
+    }
+    if (act === 'checkAll') {
+      $('chkOut').innerHTML = loading('กำลังตรวจ…');
+      try { const r = await api('admin.checkAll', { term_id: S.term }); $('chkOut').innerHTML = '<div class="alert ' + (r.ok ? 'ok' : 'err') + '">' + esc(r.message) + (r.errors.length ? '\n' + r.errors.map((e, i) => (i + 1) + '. ' + e.message).map(esc).join('\n') : '') + '</div>'; }
+      catch (e) { $('chkOut').innerHTML = errBox(e); }
+      return;
+    }
+    if (act === 'publish') {
+      const t = termObj(); const eff = t.start_date && t.start_date > S.boot.today ? t.start_date : S.boot.today;
+      return modal('เผยแพร่ตาราง', '<p>เผยแพร่ฉบับร่างล่าสุดให้ครูทุกคนเห็น ระบบจะตรวจความขัดแย้งอีกครั้งก่อนเผยแพร่</p><label class="f">เริ่มใช้ตั้งแต่วันที่<input type="date" id="pubD" value="' + eff + '"></label><label class="f">เหตุผล<input id="pubR"></label>', [['เผยแพร่', async () => {
+        const r = await api('admin.publish', { term_id: S.term, effective_from: $('pubD').value, reason: $('pubR').value }); closeModal(); clearCache(); await reloadBoot(); toast(r.message, 5000); go('check'); }, 'ok']]);
+    }
+  } catch (e) { toast(e.message || String(e), 6000); }
+});
+document.addEventListener('change', (ev) => {
+  const id = ev.target.id;
+  if (id === 'termSel') { S.term = ev.target.value; store('term', S.term); fillTerms(); go(S.page, S.arg); }
+  if (id === 'dDate') { S.dailyDate = ev.target.value; go('daily'); }
+  if (id === 'sDate') { S.dailyDate = ev.target.value; go('subs'); }
+  if (id === 'tDate') { S.dailyDate = ev.target.value; go('teacher'); }
+  if (id === 'tSel') { S.teacherId = ev.target.value; store('teacherId', S.teacherId); go('teacher'); }
+  if (id === 'aFrom' || id === 'aTo') { S.abs[id === 'aFrom' ? 'from' : 'to'] = ev.target.value; go('absence'); }
+  if (id === 'ovDay' || id === 'ovT' || id === 'ovC') { S.ov.day = Number($('ovDay').value); S.ov.teacher = $('ovT').value; S.ov.cls = $('ovC').value; go('overview'); }
+  if (id === 'admTable') { S.adm.table = ev.target.value; go('admin'); }
+});
+$('burger').addEventListener('click', () => openDrawer(true));
+$('scrim').addEventListener('click', () => openDrawer(false));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeModal(); openDrawer(false); } });
+
+// ---------- เริ่มต้น ----------
+(async function init() {
+  try {
+    S.boot = await api('public.bootstrap');
+    const saved = store('term');
+    S.term = saved && S.boot.terms.some((t) => t.term_id === saved) ? saved : S.boot.current_term_id;
+    S.dailyDate = S.boot.today;
+    try { const a = JSON.parse(sstore('adm') || 'null'); if (a) { S.admin = a; await api('admin.whoami').catch(() => setAdmin(null)); } } catch (e) { S.admin = null; }
+    fillTerms(); renderNav(); go('home');
+  } catch (e) { $('app').innerHTML = errBox(e); $('schoolSub').textContent = 'เชื่อมต่อไม่ได้'; }
+})();
+</script>
